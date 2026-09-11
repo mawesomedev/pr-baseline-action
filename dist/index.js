@@ -19438,6 +19438,11 @@ const ANCESTRY_MODES = /* @__PURE__ */ new Set([
 	"api"
 ]);
 const OTHER_BASES = /* @__PURE__ */ new Set(["skip", "pass"]);
+const SCOPES = /* @__PURE__ */ new Set([
+	"corrections",
+	"unstamped",
+	"all"
+]);
 const BASELINE_KEYS = /* @__PURE__ */ new Set([
 	"name",
 	"label",
@@ -19459,6 +19464,8 @@ function resolveConfig(options) {
 	if (!ANCESTRY_MODES.has(ancestry)) throw new ConfigError(`Invalid ancestry mode "${ancestry}": expected auto, git or api.`);
 	const otherBases = options.otherBases ?? "skip";
 	if (!OTHER_BASES.has(otherBases)) throw new ConfigError(`Invalid other-bases value "${otherBases}": expected skip or pass.`);
+	const scope = options.scope;
+	if (scope !== void 0 && !SCOPES.has(scope)) throw new ConfigError(`Invalid scope "${scope}": expected corrections, unstamped or all.`);
 	if ((options.offline ?? false) && ancestry === "api") throw new ConfigError("--offline needs git ancestry; drop --ancestry api.");
 	const baselines = options.baselines === void 0 ? shorthandBaselines({}) : validateBaselines(options.baselines);
 	const context = nonEmpty(options.context) ?? "PR baseline";
@@ -19480,6 +19487,8 @@ function resolveConfig(options) {
 		ancestry,
 		gitDir: nonEmpty(options.gitDir),
 		otherBases,
+		scope: scope ?? "corrections",
+		scopeExplicit: scope !== void 0,
 		creator,
 		tokenIsWorkflowToken: options.tokenIsWorkflowToken ?? false,
 		offline: options.offline ?? false,
@@ -19607,7 +19616,7 @@ const LISTED_BASELINES = 2;
 const ELLIPSIS = "…";
 /**
 * Combines per-baseline answers into the one status the context carries.
-* With `head`, a failing status without a configured link points at the commits the head lacks up to the first missing baseline.
+* With `head`, a failing status without a configured link points at the commits the base branch has that the head lacks.
 */
 function computeVerdict(baselines, context, head) {
 	const applicable = baselines.filter((entry) => entry.applicable);
@@ -19619,21 +19628,23 @@ function computeVerdict(baselines, context, head) {
 		missing,
 		applicable: names
 	};
-	const first = applicable.find((entry) => entry.name === missing[0])?.sha ?? null;
 	return {
 		kind: "fail",
 		status: {
 			...payload("failure", context.descriptions.fail, context, missing),
-			targetUrl: context.targetUrl ?? compareUrl(context, head, first)
+			targetUrl: context.targetUrl ?? compareUrl(context, head, context.base)
 		},
 		missing,
 		applicable: names
 	};
 }
-/** GitHub's three-dot compare: the commits reachable from the baseline that the head does not contain. */
-function compareUrl(context, head, baseline) {
-	if (context.repoUrl === void 0 || head === void 0 || baseline === null) return;
-	return `${context.repoUrl}/compare/${head}...${baseline}`;
+/**
+* GitHub's three-dot compare: the commits on the base branch that the head does not contain.
+* Naming the branch rather than the baseline commit keeps the link identical across a move, so a move alone never costs a write.
+*/
+function compareUrl(context, head, base) {
+	if (context.repoUrl === void 0 || head === void 0) return;
+	return `${context.repoUrl}/compare/${head}...${encodeURIComponent(base)}`;
 }
 /** The pass written for a PR outside the base branch when `other-bases` is `pass`. */
 function notApplicableVerdict(context) {
@@ -19666,10 +19677,13 @@ function boundDescription(text) {
 	if (points.length <= 140) return text;
 	return points.slice(0, 139).join("") + ELLIPSIS;
 }
-/** A status is current only when state, description, target URL and creator all match. */
-function statusMatches(current, intended, creator) {
-	if (current === null) return false;
-	return current.state === intended.state && (current.description ?? "") === intended.description && (current.targetUrl ?? "") === (intended.targetUrl ?? "") && current.creator === creator;
+/**
+* Whether an intended status differs from the one on the commit, and whether the difference gates a merge.
+* A creator mismatch is material because a ruleset pinned to a source is not satisfied by another creator's green.
+*/
+function compareStatus(current, intended, creator) {
+	if (current === null || current.state !== intended.state || current.creator !== creator) return "material";
+	return (current.description ?? "") !== intended.description || (current.targetUrl ?? "") !== (intended.targetUrl ?? "") ? "cosmetic" : "current";
 }
 function payload(state, template, context, baselines) {
 	return {
@@ -19694,6 +19708,29 @@ function shortSha(sha) {
 var BaselineError = class extends Error {
 	name = "BaselineError";
 };
+/** Writes and milliseconds that must both pass before another progress line; a 450-write run then logs about nine. */
+const PROGRESS_WRITES = 50;
+const PROGRESS_MS = 3e4;
+/**
+* Rate-limits progress lines to one per 50 writes and 30 seconds, whichever is slower.
+* Both thresholds, so a fast run does not narrate every batch and a slow one still says it is alive.
+*/
+function createProgressThrottle(startedAt) {
+	let lastWrites = 0;
+	let lastAt = startedAt;
+	return { due(written, at) {
+		if (written - lastWrites < PROGRESS_WRITES || at - lastAt < PROGRESS_MS) return false;
+		lastWrites = written;
+		lastAt = at;
+		return true;
+	} };
+}
+/** Whether two ref snapshots name the same baselines at the same commits; order does not matter. */
+function sameRefs(before, after) {
+	if (before.length !== after.length) return false;
+	const later = new Map(after.map((entry) => [entry.name, entry.sha]));
+	return before.every((entry) => later.has(entry.name) && later.get(entry.name) === entry.sha);
+}
 /** Every baseline as `{ name, sha }`, absent ones included, for adapters that verify them against their own view. */
 function refSnapshot(baselines) {
 	return baselines.map((baseline) => ({
@@ -20698,7 +20735,7 @@ async function evaluateWithGuard(input) {
 async function write(runtime, sha, verdict, result) {
 	const creator = await runtime.creator();
 	const reporter = await runtime.reporter();
-	if (statusMatches(await reporter.current(sha), verdict.status, creator)) {
+	if (compareStatus(await reporter.current(sha), verdict.status, creator) === "current") {
 		runtime.logger.info(`Status already current (${verdict.status.state}); nothing written.`);
 		return {
 			...result,
@@ -20979,10 +21016,42 @@ function createWriteBudget(options) {
 		}
 	};
 }
-/** Brings every in-scope open PR's status in line with the current baselines, writing only changes. */
+/** What a scope does to the PRs it selects, and what it calls the ones it has not reached yet. */
+const VERB = {
+	corrections: "check",
+	unstamped: "stamp",
+	all: "visit"
+};
+/** Plain wording for what stopped a run, for the closing line. */
+const STOP_PHRASE = {
+	"write-cap": "the write cap",
+	"primary-budget": "the primary budget",
+	"rate-limit": "a rate limit",
+	deferred: "a PR whose head was still moving",
+	failed: "a failure that repeats for every PR"
+};
+/** What the population left in each scope is called, so a progress line reads naturally. */
+const REMAINING_NOUN = {
+	corrections: "still to check",
+	unstamped: "still unstamped",
+	all: "still to visit"
+};
+/** Stops the next run continues from on its own; anything else needs someone to look. */
+const PAUSED_REASONS = /* @__PURE__ */ new Set([
+	"write-cap",
+	"primary-budget",
+	"rate-limit"
+]);
+/** Brings the scoped open PRs' statuses in line with the current baselines, writing only what differs. */
 async function runRefreshPrStatuses(runtime, input = {}) {
 	const { config, api, logger } = runtime;
 	if (config.offline) throw new ConfigError("refresh-pr-statuses needs the API; --offline applies to refresh-pr-status only.");
+	assertScopeUsable(runtime);
+	let scope = input.scope ?? config.scope;
+	if (runtime.customReporter) {
+		if (!config.scopeExplicit && input.scope === void 0) logger.warn("A custom reporter owns the statuses, which the PR listing cannot report; refreshing every open PR.");
+		scope = "all";
+	}
 	const ancestry = await runtime.ancestry();
 	const budget = createWriteBudget({
 		maxWritesPerRun: config.maxWritesPerRun,
@@ -20993,6 +21062,7 @@ async function runRefreshPrStatuses(runtime, input = {}) {
 	const counts = {
 		written: 0,
 		skipped: 0,
+		cosmetic: 0,
 		closed: 0,
 		deferred: 0,
 		outOfScope: 0,
@@ -21001,17 +21071,36 @@ async function runRefreshPrStatuses(runtime, input = {}) {
 	let reason;
 	/** Baselines that left the base branch; every PR then gets the misconfiguration pass. */
 	let offBase = [];
-	const finish = (base, baselines, openPulls) => {
+	const finish = (base, baselines, openPulls, selected) => {
 		const incomplete = reason !== void 0 || counts.deferred > 0 || counts.failed > 0;
 		if (incomplete && reason === void 0) reason = counts.deferred > 0 ? "deferred" : "failed";
-		if (incomplete) logger.warn(`Refresh incomplete (${reason}). ${RETRY_HINT}`);
+		const paused = incomplete && counts.failed === 0 && counts.deferred === 0 && counts.written > 0 && reason !== void 0 && PAUSED_REASONS.has(reason);
+		const accounted = counts.written + counts.skipped + counts.cosmetic + counts.closed + counts.deferred + counts.outOfScope + counts.failed;
+		const remaining = Math.max(0, selected - accounted);
+		const summary = `${counts.written} written, ${counts.skipped} skipped, ${counts.cosmetic} cosmetic, ${counts.failed} failed, ${remaining} remaining`;
+		if (paused) {
+			const runs = Math.ceil(remaining / config.maxWritesPerRun);
+			const promotedAgain = runtime.customReporter || offBase.length > 0;
+			const more = `About ${runs} more ${runs === 1 ? "run" : "runs"} at this cap`;
+			const next = scope === "corrections" || promotedAgain ? `${more}; the schedule continues automatically.` : `${more}, at scope ${scope}; a run at the default scope will not continue it.`;
+			logger.warn(`Paused on ${STOP_PHRASE[reason]}: ${summary}.\n${next}`);
+		} else if (incomplete && counts.written === 0 && reason !== void 0 && PAUSED_REASONS.has(reason)) {
+			const cause = reason === "write-cap" ? "the cap went on attempts that were abandoned" : "another workflow is consuming the repository's request budget";
+			logger.warn(`Stopped on ${STOP_PHRASE[reason]} having written nothing: ${summary}. ${cause}. ${RETRY_HINT}`);
+		} else if (incomplete) logger.warn(`Refresh incomplete (${reason}): ${summary}. ${RETRY_HINT}`);
+		else logger.info(`Refresh complete: ${summary}.`);
 		return {
 			base,
 			baselines,
 			openPulls,
+			scope,
+			selected,
+			excluded: openPulls - selected,
+			remaining,
 			misconfigured: offBase,
 			...counts,
 			incomplete,
+			paused,
 			...reason === void 0 ? {} : { reason },
 			entries,
 			ancestry: ancestry.name,
@@ -21020,6 +21109,13 @@ async function runRefreshPrStatuses(runtime, input = {}) {
 	};
 	let setup;
 	let knownOpenPulls = 0;
+	let knownSelected = 0;
+	let buckets = {
+		passing: 0,
+		failing: 0,
+		other: 0,
+		unstamped: 0
+	};
 	let resolvedBase;
 	let resolvedBaselines = input.baselines;
 	try {
@@ -21030,19 +21126,35 @@ async function runRefreshPrStatuses(runtime, input = {}) {
 		const baselines = input.baselines ?? await runtime.readBaselines();
 		resolvedBaselines = baselines;
 		const baseHead = await runtime.head();
+		const refs = input.verifyRefs ?? refSnapshot(baselines);
 		const list = async () => (await listOpenPulls(api, config.repo, {
 			base,
 			context: config.context
 		})).filter((pull) => pull.baseRef === base && (config.includeDrafts || !pull.isDraft));
 		let inScope = await list();
 		knownOpenPulls = inScope.length;
-		const prepared = await ancestry.prepare?.({
+		knownSelected = inScope.filter((pull) => selects(pull, scope)).length;
+		await ancestry.prepare?.({
 			shas: [baseHead],
-			pulls: inScope.map((pull) => pull.number),
-			refs: input.verifyRefs ?? refSnapshot(baselines)
+			pulls: [],
+			refs
 		});
 		offBase = await baselinesOffBase(ancestry, baselines, baseHead);
-		if (offBase.length > 0) logger.warn(`Baseline ${offBase.join(", ")} is not on ${base}; posting passes instead of blocking. Repair it with a forced move to a commit on ${base}.`);
+		if (offBase.length > 0) {
+			logger.warn(`Baseline ${offBase.join(", ")} is not on ${base}; posting passes instead of blocking. Repair it with a forced move to a commit on ${base}.`);
+			scope = "all";
+		}
+		buckets = tally(inScope);
+		inScope = inScope.filter((pull) => selects(pull, scope));
+		knownSelected = inScope.length;
+		logger.info(`Base ${base} at ${baseHead.slice(0, 12)}; ${describe$1(baselines)}.`);
+		logger.info(`${knownOpenPulls} open PRs: ${buckets.passing} passing, ${buckets.failing} failing, ${buckets.other} other, ${buckets.unstamped} unstamped.`);
+		logger.info(`Scope ${scope}: ${knownSelected} ${knownSelected === 1 ? "PR" : "PRs"} to ${VERB[scope]}, at most ${Math.min(knownSelected, config.maxWritesPerRun)} writes.`);
+		const prepared = await ancestry.prepare?.({
+			shas: [],
+			pulls: inScope.map((pull) => pull.number),
+			refs
+		});
 		if (prepared !== void 0) {
 			const stillOpen = new Map((await list()).map((pull) => [pull.number, pull]));
 			for (const pull of inScope) if (!stillOpen.has(pull.number)) {
@@ -21065,7 +21177,7 @@ async function runRefreshPrStatuses(runtime, input = {}) {
 		if (isGitHubError(error, "rate-limit")) {
 			logger.warn(error.message);
 			reason = "rate-limit";
-			return finish(resolvedBase ?? config.base ?? "", resolvedBaselines ?? [], knownOpenPulls);
+			return finish(resolvedBase ?? config.base ?? "", resolvedBaselines ?? [], knownOpenPulls, knownSelected);
 		}
 		throw error;
 	}
@@ -21078,8 +21190,54 @@ async function runRefreshPrStatuses(runtime, input = {}) {
 	};
 	const misconfigured = offBase.length > 0 ? misconfiguredVerdict(offBase, context) : void 0;
 	const inScope = setup.pulls;
-	logger.info(`Base ${base} at ${baseHead.slice(0, 12)}; ${inScope.length} open PRs; ${describe$1(baselines)}.`);
+	const progress = createProgressThrottle(runtime.now());
 	const settled = /* @__PURE__ */ new Map();
+	const cosmetic = /* @__PURE__ */ new Map();
+	/** Writes one status through the budget; false when the run must stop. */
+	const write = async (pull, verdict) => {
+		try {
+			if (await writeWithRetries(reporter, pull.headSha, verdict.status, {
+				async before() {
+					const decision = budget.next(api.rest.remaining);
+					if (!decision.ok) {
+						reason = decision.reason;
+						return false;
+					}
+					if (decision.waitMs > 0 && !config.dryRun) await runtime.sleep(decision.waitMs);
+					budget.record();
+					return true;
+				},
+				sleep: runtime.sleep,
+				retryBaseMs: config.retryBaseMs
+			}) === "abandoned") return false;
+			settled.set(pull.headSha, { verdict });
+			counts.written++;
+			entries.push(entry(pull, "written", verdict));
+			if (progress.due(counts.written, runtime.now())) {
+				const left = knownSelected - (counts.written + counts.skipped + counts.cosmetic + counts.closed + counts.deferred + counts.outOfScope + counts.failed);
+				logger.info(`Written ${counts.written} of at most ${Math.min(knownSelected, config.maxWritesPerRun)}; ${Math.max(0, left)} PRs ${REMAINING_NOUN[scope]}.`);
+			}
+			return true;
+		} catch (error) {
+			if (error instanceof ConfigError || error instanceof GitError) throw error;
+			counts.failed++;
+			entries.push(entry(pull, "failed", verdict, error));
+			settled.set(pull.headSha, {
+				verdict,
+				error
+			});
+			logger.warn(`PR #${pull.number}: ${message(error)}`);
+			if (isGitHubError(error, "rate-limit")) {
+				reason = "rate-limit";
+				return false;
+			}
+			if (isGitHubError(error, "permission") || isGitHubError(error, "auth")) {
+				reason = "failed";
+				return false;
+			}
+			return true;
+		}
+	};
 	for (const listed of inScope) {
 		let pull = listed;
 		let reconciled = false;
@@ -21107,11 +21265,17 @@ async function runRefreshPrStatuses(runtime, input = {}) {
 			};
 			reconciled = true;
 		}
+		const waiting = cosmetic.get(pull.headSha);
+		if (waiting !== void 0) {
+			waiting.pulls.push(pull);
+			continue;
+		}
 		const shared = settled.get(pull.headSha);
 		if (shared !== void 0) {
 			if (shared.error === void 0) {
-				counts.skipped++;
-				entries.push(entry(pull, "skipped", shared.verdict));
+				const outcome = shared.cosmetic === true ? "cosmetic" : "skipped";
+				counts[outcome]++;
+				entries.push(entry(pull, outcome, shared.verdict));
 			} else {
 				counts.failed++;
 				entries.push(entry(pull, "failed", shared.verdict, shared.error));
@@ -21146,50 +21310,72 @@ async function runRefreshPrStatuses(runtime, input = {}) {
 			settled.set(pull.headSha, { error });
 			continue;
 		}
-		if (statusMatches(current, verdict.status, creator)) {
+		const difference = compareStatus(current, verdict.status, creator);
+		if (difference === "current") {
 			settled.set(pull.headSha, { verdict });
 			counts.skipped++;
 			entries.push(entry(pull, "skipped", verdict));
 			continue;
 		}
-		try {
-			if (await writeWithRetries(reporter, pull.headSha, verdict.status, {
-				async before() {
-					const decision = budget.next(api.rest.remaining);
-					if (!decision.ok) {
-						reason = decision.reason;
-						return false;
-					}
-					if (decision.waitMs > 0 && !config.dryRun) await runtime.sleep(decision.waitMs);
-					budget.record();
-					return true;
-				},
-				sleep: runtime.sleep,
-				retryBaseMs: config.retryBaseMs
-			}) === "abandoned") break;
-			settled.set(pull.headSha, { verdict });
-			counts.written++;
-			entries.push(entry(pull, "written", verdict));
-		} catch (error) {
-			if (error instanceof ConfigError || error instanceof GitError) throw error;
-			counts.failed++;
-			entries.push(entry(pull, "failed", verdict, error));
-			settled.set(pull.headSha, {
+		if (difference === "cosmetic") {
+			if (scope === "all") cosmetic.set(pull.headSha, {
 				verdict,
-				error
+				pulls: [pull]
 			});
-			logger.warn(`PR #${pull.number}: ${message(error)}`);
-			if (isGitHubError(error, "rate-limit")) {
-				reason = "rate-limit";
-				break;
+			else {
+				settled.set(pull.headSha, {
+					verdict,
+					cosmetic: true
+				});
+				counts.cosmetic++;
+				entries.push(entry(pull, "cosmetic", verdict));
 			}
-			if (isGitHubError(error, "permission") || isGitHubError(error, "auth")) {
-				reason = "failed";
-				break;
-			}
+			continue;
 		}
+		if (!await write(pull, verdict)) break;
 	}
-	return finish(base, baselines, inScope.length);
+	if (reason === void 0) for (const queued of cosmetic.values()) {
+		const [first, ...rest] = queued.pulls;
+		if (first === void 0) continue;
+		const keepGoing = await write(first, queued.verdict);
+		const outcome = settled.get(first.headSha);
+		if (outcome !== void 0) for (const sibling of rest) if (outcome.error === void 0) {
+			counts.skipped++;
+			entries.push(entry(sibling, "skipped", queued.verdict));
+		} else {
+			counts.failed++;
+			entries.push(entry(sibling, "failed", queued.verdict, outcome.error));
+		}
+		if (!keepGoing) break;
+	}
+	return finish(base, baselines, knownOpenPulls, knownSelected);
+}
+/** How the open PRs stand on the context, for the plan line; the same four buckets `report` prints. */
+function tally(pulls) {
+	const counts = {
+		passing: 0,
+		failing: 0,
+		other: 0,
+		unstamped: 0
+	};
+	for (const pull of pulls) if (pull.status === null) counts.unstamped++;
+	else if (pull.status.state === "success") counts.passing++;
+	else if (pull.status.state === "failure") counts.failing++;
+	else counts.other++;
+	return counts;
+}
+/**
+* Refuses a scope a custom reporter cannot honour, since the PR listing's statuses are not its.
+* `move-baseline` calls this before it moves anything, so a refusal is never a half-run.
+*/
+function assertScopeUsable(runtime) {
+	const { config } = runtime;
+	if (runtime.customReporter && config.scopeExplicit && config.scope !== "all") throw new ConfigError(`A custom reporter owns the statuses a refresh compares against, so scope "${config.scope}" cannot be applied; use "all".`);
+}
+/** Whether a scope selects a PR, read from the status the listing carries. */
+function selects(pull, scope) {
+	if (scope === "all") return true;
+	return scope === "corrections" ? pull.status?.state === "success" : pull.status === null;
 }
 /**
 * Decides a PR the listing and the fetch disagree about, through one REST read.
@@ -21244,7 +21430,10 @@ async function runMoveBaseline(runtime, options) {
 	};
 	if (options.baseline !== void 0 && options.baseline !== "" && !config.baselines.some((baseline) => baseline.name === options.baseline)) throw new ConfigError(`No configured baseline is named "${options.baseline}".`);
 	const base = await runtime.base();
-	if (options.refreshPrStatuses) await runtime.creator();
+	if (options.refreshPrStatuses) {
+		assertScopeUsable(runtime);
+		await runtime.creator();
+	}
 	const baselines = await runtime.readBaselines();
 	const before = refSnapshot(baselines);
 	const selected = select(baselines, options.baseline);
@@ -21282,8 +21471,10 @@ async function runMoveBaseline(runtime, options) {
 		moves,
 		dryRun: config.dryRun
 	};
-	if (options.refreshPrStatuses) result.refresh = await runRefreshPrStatuses(runtime, {
+	const changed = !sameRefs(before, authoritative) || moves.some((move) => move.moved);
+	if (options.refreshPrStatuses && (changed || options.refreshWhenUnchanged !== false)) result.refresh = await runRefreshPrStatuses(runtime, {
 		baselines: authoritative,
+		...moves.some((move) => move.moved && move.reason === "forced") ? { scope: "all" } : {},
 		...config.dryRun ? { verifyRefs: before } : {}
 	});
 	return result;
@@ -21428,12 +21619,27 @@ async function runReport(runtime) {
 		baselines: report,
 		offBase,
 		openPulls: pulls.length,
+		...breakdown(pulls),
 		ancestry: ancestry.name
 	};
 	if (ancestry.name === "git" && offBase.length === 0) Object.assign(result, await staleness(runtime, ancestry, baselines, head, pulls, base, prepared?.heads));
 	return result;
 }
-/** Counts PRs whose status is current versus stale; skipped with a warning when the creator cannot be resolved. */
+/** How the open PRs stand on the context, which is what says whether the check can be made required. */
+function breakdown(pulls) {
+	const counts = {
+		passing: 0,
+		failing: 0,
+		other: 0,
+		unstamped: 0
+	};
+	for (const pull of pulls) if (pull.status === null) counts.unstamped++;
+	else if (pull.status.state === "success") counts.passing++;
+	else if (pull.status.state === "failure") counts.failing++;
+	else counts.other++;
+	return counts;
+}
+/** Counts PRs whose status is current, materially stale or cosmetically stale; skipped when the creator cannot be resolved. */
 async function staleness(runtime, ancestry, baselines, head, pulls, base, heads) {
 	let creator;
 	try {
@@ -21453,6 +21659,7 @@ async function staleness(runtime, ancestry, baselines, head, pulls, base, heads)
 		repoUrl: repoUrl(config)
 	};
 	let stale = 0;
+	let cosmetic = 0;
 	let current = 0;
 	for (const pull of pulls) {
 		const fetched = heads?.get(pull.number);
@@ -21468,11 +21675,14 @@ async function staleness(runtime, ancestry, baselines, head, pulls, base, heads)
 			context,
 			logger
 		});
-		if (statusMatches(pull.status, verdict.status, creator)) current++;
+		const difference = compareStatus(pull.status, verdict.status, creator);
+		if (difference === "current") current++;
+		else if (difference === "cosmetic") cosmetic++;
 		else stale++;
 	}
 	return {
 		stale,
+		cosmetic,
 		current
 	};
 }
@@ -21832,12 +22042,20 @@ const OUTPUT_NAMES = [
 	"base",
 	"baselines",
 	"missing",
+	"scope",
+	"selected",
+	"excluded",
 	"written",
 	"skipped",
+	"cosmetic",
 	"closed",
 	"deferred",
 	"failed",
+	"remaining",
 	"incomplete",
+	"paused",
+	"moved",
+	"moved-baselines",
 	"summary",
 	"results-file"
 ];
@@ -21875,12 +22093,20 @@ function emit(values) {
 		...Object.fromEntries(OUTPUT_NAMES.map((name) => [name, ""])),
 		baselines: "[]",
 		missing: "[]",
+		scope: "",
+		selected: 0,
+		excluded: 0,
 		written: 0,
 		skipped: 0,
+		cosmetic: 0,
 		closed: 0,
 		deferred: 0,
 		failed: 0,
+		remaining: 0,
 		incomplete: false,
+		paused: false,
+		moved: false,
+		"moved-baselines": "[]",
 		...values
 	});
 }
@@ -21930,14 +22156,14 @@ function readEvent() {
 /** Maps the event to a command in `auto` mode; explicit modes take the inputs as they are. */
 function decide(selected, event, base, token = "workflow") {
 	const restricted = token === "workflow" && event.actor === "dependabot[bot]";
-	const plan = selected === "auto" ? auto(event, base, token) : explicit(selected);
+	const plan = selected === "auto" ? auto(event, base, token) : explicit(selected, event);
 	return restricted ? restrict(plan) : plan;
 }
 /** Turns a plan into what a read-only token can still do: evaluate, or nothing. */
 function restrict(plan) {
 	if (plan.skip !== void 0 || plan.mode === "report") return plan;
 	if (plan.mode === "refresh-pr-status") {
-		if (plan.report !== false) notice("Dependabot triggered this run, so its token cannot write; the commit is evaluated only and the scheduled run stamps it.");
+		if (plan.report !== false) notice("Dependabot triggered this run, so its token cannot write and the commit is evaluated only. Configure a custom token, stored as a Dependabot secret so this run can read it, or schedule a refresh-pr-statuses run with scope unstamped to stamp the commit later.");
 		return {
 			...plan,
 			report: false
@@ -21945,7 +22171,7 @@ function restrict(plan) {
 	}
 	return {
 		mode: "refresh-pr-status",
-		skip: "Dependabot triggered this run, so its token cannot move a baseline or write statuses; the scheduled run recovers it."
+		skip: "Dependabot triggered this run, so its token cannot move a baseline or write statuses; the scheduled run makes the move, and a custom token or a scope unstamped backfill stamps the commit."
 	};
 }
 function auto(event, base, token) {
@@ -21967,7 +22193,8 @@ function auto(event, base, token) {
 			return {
 				mode: "move-baseline",
 				force: false,
-				refreshPrStatuses: true
+				refreshPrStatuses: true,
+				refreshWhenUnchanged: false
 			};
 		case "pull_request": {
 			if (pull === void 0) return {
@@ -22003,7 +22230,8 @@ function auto(event, base, token) {
 			return {
 				mode: "move-baseline",
 				force: false,
-				refreshPrStatuses: true
+				refreshPrStatuses: true,
+				refreshWhenUnchanged: false
 			};
 		}
 		case "schedule":
@@ -22022,7 +22250,8 @@ function canWriteOnPullRequest(head, repository, token) {
 	if (fork) notice("A pull_request run from a fork cannot write statuses; outputs are set and nothing is written. Use pull_request_target to report on fork PRs.");
 	return !fork;
 }
-function explicit(selected) {
+/** A pinned mode still gets the event's refresh rule, so `mode: move-baseline` on a push behaves like `auto`. */
+function explicit(selected, event) {
 	switch (selected) {
 		case "refresh-pr-status": {
 			const sha = getInput("sha");
@@ -22036,10 +22265,17 @@ function explicit(selected) {
 		case "move-baseline": return {
 			mode: "move-baseline",
 			force: booleanInput("force", false),
-			refreshPrStatuses: booleanInput("refresh-pr-statuses-after-move", true)
+			refreshPrStatuses: booleanInput("refresh-pr-statuses-after-move", true),
+			refreshWhenUnchanged: refreshesWhenUnchanged(event)
 		};
 		default: return { mode: selected };
 	}
+}
+/** The events that fire on every base-branch push get no refresh when nothing moved; everything else keeps one. */
+function refreshesWhenUnchanged(event) {
+	const pull = event.payload["pull_request"];
+	if (event.name === "push") return false;
+	return !(event.name === "pull_request_target" && event.payload["action"] === "closed" && pull?.merged === true);
 }
 async function execute(client, plan, options) {
 	switch (plan.mode) {
@@ -22058,6 +22294,7 @@ async function execute(client, plan, options) {
 			await reportMove(await client.moveBaseline({
 				force: plan.force ?? false,
 				refreshPrStatuses: plan.refreshPrStatuses ?? true,
+				refreshWhenUnchanged: plan.refreshWhenUnchanged ?? true,
 				...selector.length === 0 ? {} : { baseline: selector }
 			}), options.dryRun ?? false);
 			return;
@@ -22088,6 +22325,7 @@ function clientOptions() {
 	assign(options, "creator", getInput("creator"));
 	assign(options, "ancestry", getInput("ancestry"));
 	assign(options, "otherBases", getInput("other-bases"));
+	assign(options, "scope", getInput("scope"));
 	assign(options, "maxWritesPerRun", positiveInteger(getInput("max-writes-per-run"), "max-writes-per-run"));
 	assign(options, "maxWritesPerMinute", positiveInteger(getInput("max-writes-per-minute"), "max-writes-per-minute"));
 	const descriptions = {};
@@ -22216,7 +22454,10 @@ function boundedSummary(result, extra = {}, budget = OUTPUT_BUDGET) {
 		truncated: true
 	});
 }
-async function reportRefreshPrStatuses(result, extra = {}) {
+async function reportRefreshPrStatuses(result, extra = {}, move = {
+	moved: false,
+	movedBaselines: []
+}) {
 	const file = join(process.env["RUNNER_TEMP"] ?? process.cwd(), `pr-baseline-refresh-${Date.now()}.json`);
 	writeFileSync(file, JSON.stringify({
 		...extra,
@@ -22224,18 +22465,27 @@ async function reportRefreshPrStatuses(result, extra = {}) {
 	}, null, 2));
 	const misconfigured = result.misconfigured.length === 0 ? void 0 : `Baseline ${result.misconfigured.join(", ")} is not on ${result.base}; every PR passes until a forced move puts it back.`;
 	const unannounced = misconfigured !== void 0 && (result.written > 0 || result.openPulls === 0);
+	const offBase = `Baseline ${result.misconfigured.join(", ")} is not on ${result.base}`;
 	emit({
-		state: result.incomplete || unannounced ? "failure" : "success",
-		description: result.incomplete ? `Refresh incomplete (${result.reason})` : misconfigured === void 0 ? "Refresh complete" : `Baseline ${result.misconfigured.join(", ")} is not on ${result.base}`,
+		state: result.incomplete && !result.paused || unannounced ? "failure" : "success",
+		description: result.incomplete && !result.paused ? `Refresh incomplete (${result.reason})` : unannounced ? offBase : result.paused ? `Refresh paused (${result.reason}), ${result.remaining} remaining` : misconfigured === void 0 ? "Refresh complete" : offBase,
 		base: result.base,
 		baselines: baselinesOutput(result.baselines),
 		missing: "[]",
+		scope: result.scope,
+		selected: result.selected,
+		excluded: result.excluded,
 		written: result.written,
 		skipped: result.skipped,
+		cosmetic: result.cosmetic,
 		closed: result.closed,
 		deferred: result.deferred,
 		failed: result.failed,
+		remaining: result.remaining,
 		incomplete: result.incomplete,
+		paused: result.paused,
+		moved: move.moved,
+		"moved-baselines": JSON.stringify(move.movedBaselines),
 		summary: boundedSummary(result, extra),
 		"results-file": file
 	});
@@ -22245,11 +22495,19 @@ async function reportRefreshPrStatuses(result, extra = {}) {
 			header: true
 		},
 		{
+			data: "Selected",
+			header: true
+		},
+		{
 			data: "Written",
 			header: true
 		},
 		{
 			data: "Skipped",
+			header: true
+		},
+		{
+			data: "Cosmetic",
 			header: true
 		},
 		{
@@ -22267,24 +22525,32 @@ async function reportRefreshPrStatuses(result, extra = {}) {
 		{
 			data: "Failed",
 			header: true
+		},
+		{
+			data: "Remaining",
+			header: true
 		}
 	], [
 		String(result.openPulls),
+		`${result.selected} (${result.scope})`,
 		String(result.written),
 		String(result.skipped),
+		String(result.cosmetic),
 		String(result.closed),
 		String(result.deferred),
 		String(result.outOfScope),
-		String(result.failed)
+		String(result.failed),
+		String(result.remaining)
 	]]);
-	if (result.incomplete) summary$1.addRaw(`\nIncomplete: ${result.reason}. Dispatch the workflow to continue.\n`);
+	if (result.paused) summary$1.addRaw(`\nPaused: ${result.reason}. ${result.remaining} PRs left at scope ${result.scope}.\n`);
+	else if (result.incomplete) summary$1.addRaw(`\nIncomplete: ${result.reason}. Dispatch the workflow to continue.\n`);
 	if (misconfigured !== void 0) summary$1.addRaw(`\n${misconfigured}\n`);
 	await writeSummary();
 	if (misconfigured !== void 0) {
 		if (unannounced) setFailed(misconfigured);
 		else warning(misconfigured);
 	}
-	if (result.incomplete) setFailed(`Refresh incomplete (${result.reason}); dispatch the workflow to continue.`);
+	if (result.incomplete && !result.paused) setFailed(`Refresh incomplete (${result.reason}); ${result.remaining} PRs left. Retry by dispatching the workflow.`);
 }
 async function reportMove(result, dryRun) {
 	const moved = result.moves.filter((move) => move.moved);
@@ -22318,7 +22584,10 @@ async function reportMove(result, dryRun) {
 	])]);
 	await writeSummary();
 	if (result.refresh !== void 0) {
-		await reportRefreshPrStatuses(result.refresh, { moves: result.moves });
+		await reportRefreshPrStatuses(result.refresh, { moves: result.moves }, {
+			moved: moved.length > 0,
+			movedBaselines: moved.map((move) => move.name)
+		});
 		return;
 	}
 	emit({
@@ -22333,6 +22602,8 @@ async function reportMove(result, dryRun) {
 		deferred: 0,
 		failed: 0,
 		incomplete: false,
+		moved: moved.length > 0,
+		"moved-baselines": JSON.stringify(moved.map((move) => move.name)),
 		summary: JSON.stringify(result)
 	});
 }
@@ -22374,7 +22645,8 @@ async function reportReport(result) {
 		baseline.onBase === null ? "" : baseline.onBase ? "yes" : "NO",
 		String(baseline.bound)
 	])]);
-	if (result.stale !== void 0 && result.current !== void 0) summary$1.addRaw(`\n${result.current} PRs current, ${result.stale} stale.\n`);
+	summary$1.addRaw(`\n${result.passing} passing, ${result.failing} failing, ${result.other} other, ${result.unstamped} unstamped.\n`);
+	if (result.stale !== void 0 && result.current !== void 0) summary$1.addRaw(`\n${result.current} PRs current, ${result.stale} stale, ${result.cosmetic ?? 0} differing only in wording or link.\n`);
 	await writeSummary();
 	if (result.offBase.length > 0) setFailed(`Baseline ${result.offBase.join(", ")} is not on ${result.base}; fix the baseline.`);
 }
