@@ -22201,7 +22201,12 @@ function auto(event, base, token) {
 				mode: "refresh-pr-status",
 				skip: "pull_request event without a pull_request payload, which happens for some fork PRs; nothing to do."
 			};
-			const report = canWriteOnPullRequest(pull.head.repo, repository, token);
+			const fork = isFork(pull.head.repo, repository);
+			if (fork && getInput("token").length === 0) return {
+				mode: "refresh-pr-status",
+				skip: "The token input is empty, which is what a fork pull_request run gets from a secret; nothing can be written. Report on fork PRs through pull_request_target, or through a refresh with scope: unstamped."
+			};
+			const report = canWriteOnPullRequest(fork, token);
 			return {
 				mode: "refresh-pr-status",
 				sha: pull.head.sha,
@@ -22243,11 +22248,14 @@ function auto(event, base, token) {
 		default: throw new ConfigError(`mode: auto has no mapping for the ${event.name || "unknown"} event; pass an explicit mode.`);
 	}
 }
+/** The head repository differs from the one the run belongs to, or the payload dropped it altogether. */
+function isFork(head, repository) {
+	return head === null || head.full_name !== void 0 && repository?.full_name !== void 0 && head.full_name.toLowerCase() !== repository.full_name.toLowerCase();
+}
 /** The workflow token is read-only on a fork PR; any other token is the consumer's choice and is assumed to write. */
-function canWriteOnPullRequest(head, repository, token) {
+function canWriteOnPullRequest(fork, token) {
 	if (token === "custom") return true;
-	const fork = head === null || head.full_name !== void 0 && repository?.full_name !== void 0 && head.full_name.toLowerCase() !== repository.full_name.toLowerCase();
-	if (fork) notice("A pull_request run from a fork cannot write statuses; outputs are set and nothing is written. Use pull_request_target to report on fork PRs.");
+	if (fork) notice("A pull_request run from a fork cannot write statuses; outputs are set and nothing is written. Report on fork PRs through pull_request_target, which a public repository has to allow in an Actions event policy, or through a refresh with scope: unstamped.");
 	return !fork;
 }
 /** A pinned mode still gets the event's refresh rule, so `mode: move-baseline` on a push behaves like `auto`. */
